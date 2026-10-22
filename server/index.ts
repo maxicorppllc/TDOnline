@@ -14,7 +14,7 @@ import { Game } from '../src/game.ts';
 import type { Command } from '../src/game.ts';
 import { TICK } from '../src/config.ts';
 import {
-  CHECKSUM_EVERY, MAP_SIZES, QUEUE_WAIT, RECONNECT_GRACE, TICKS_PER_BATCH,
+  CHECKSUM_EVERY, MAP_SIZES, PARTY_CODE_CHARS, PARTY_CODE_LEN, QUEUE_WAIT, RECONNECT_GRACE, TICKS_PER_BATCH, cleanCode,
 } from '../src/protocol.ts';
 import type { ClientMsg, LiveMatch, ServerMsg } from '../src/protocol.ts';
 
@@ -30,8 +30,11 @@ interface Client {
   name: string;
   token: string;
   queue: Queue | null;
+  party: Party | null;
   match: Match | null;
   pid: number;
+  /** Wrong party codes tried on this connection; guessing codes is cut off after a few. */
+  badJoins: number;
   /** Simple flood control: commands allowed this second. */
   budget: number;
   /** Messages of any kind this second. */
@@ -44,6 +47,10 @@ interface Client {
 const MAX_CLIENTS = 300;
 const MAX_MATCHES = 40;
 const SNAPSHOT_GAP_MS = 3000;
+const MAX_PARTY = Math.max(...MAP_SIZES);
+/** An empty party stays joinable this long, so a host who refreshes can get back in. */
+const PARTY_KEEP_MS = 60_000;
+const MAX_BAD_JOINS = 10;
 
 let nextClientId = 1;
 const clients = new Set<Client>();
@@ -116,6 +123,84 @@ class Queue {
 }
 
 const queues = new Map(MAP_SIZES.map((n) => [n, new Queue(n)]));
+
+// ------------------------------------------------------------------ parties
+
+const parties = new Map<string, Party>();
+
+function newCode(): string {
+  for (;;) {
+    let code = '';
+    for (let i = 0; i < PARTY_CODE_LEN; i++) code += PARTY_CODE_CHARS[Math.floor(Math.random() * PARTY_CODE_CHARS.length)];
+    if (!parties.has(code)) return code;
+  }
+}
+
+/**
+ * Friends who joined through one invite link. The first member is the host, who
+ * picks the map size and starts; bots take the seats nobody fills. The party
+ * outlives its matches, so the same group can go again.
+ */
+class Party {
+  code = newCode();
+  size: number;
+  members: Client[] = [];
+  emptySince = 0;
+
+  constructor(size: number) {
+    this.size = size;
+    parties.set(this.code, this);
+  }
+
+  get host(): Client | undefined {
+    return this.members[0];
+  }
+
+  add(c: Client): void {
+    if (this.members.includes(c)) return;
+    this.members.push(c);
+    c.party = this;
+    this.emptySince = 0;
+    // Grow the map to fit everyone.
+    if (this.size < this.members.length) this.size = MAP_SIZES.find((n) => n >= this.members.length) ?? MAX_PARTY;
+    this.broadcast();
+  }
+
+  remove(c: Client): void {
+    this.members = this.members.filter((m) => m !== c);
+    c.party = null;
+    if (!this.members.length) this.emptySince = Date.now();
+    this.broadcast();
+  }
+
+  /** Whether a member is free to be put into a new match. */
+  free(c: Client): boolean {
+    return !c.match || c.pid < 0 || c.match.game.phase === 'over';
+  }
+
+  start(c: Client): void {
+    if (c !== this.host) return;
+    const going = this.members.filter((m) => this.free(m));
+    if (!going.length) return;
+    if (matches.size >= MAX_MATCHES) {
+      send(c, { k: 'error', text: 'The server is busy right now. Try again in a few seconds.' });
+      return;
+    }
+    // Pull anyone still looking at the last match's results into the new one.
+    for (const m of going) {
+      m.match?.drop(m, true);
+      m.match = null;
+      m.pid = -1;
+    }
+    console.log(`party ${this.code}: starting a ${this.size}-player match`);
+    new Match(this.size, going);
+  }
+
+  broadcast(): void {
+    const members = this.members.map((m) => ({ name: m.name, host: m === this.host, playing: !this.free(m) }));
+    this.members.forEach((m, you) => send(m, { k: 'party', code: this.code, size: this.size, members, you }));
+  }
+}
 
 // ------------------------------------------------------------------ matches
 
@@ -291,6 +376,10 @@ setInterval(() => {
     q.check();
     q.broadcast();
   }
+  for (const [code, p] of parties) {
+    if (!p.members.length && Date.now() - p.emptySince > PARTY_KEEP_MS) parties.delete(code);
+    else p.broadcast(); // keeps who's still in a match current
+  }
   const lobby: ServerMsg = {
     k: 'lobby',
     online: clients.size,
@@ -300,7 +389,7 @@ setInterval(() => {
   for (const c of clients) {
     c.budget = 40;
     c.msgs = 0;
-    if (!c.match && !c.queue) send(c, lobby);
+    if (!c.match && !c.queue && !c.party) send(c, lobby);
   }
 }, 1000);
 
@@ -324,11 +413,12 @@ function onMessage(c: Client, msg: ClientMsg): void {
         m.rejoin(c, pid);
         break;
       }
+      c.party?.broadcast(); // new name
       break;
     }
     case 'queue': {
       const q = queues.get(Number(msg.size));
-      if (!q || c.match) return;
+      if (!q || c.match || c.party) return;
       c.queue?.remove(c);
       q.add(c);
       break;
@@ -338,6 +428,44 @@ function onMessage(c: Client, msg: ClientMsg): void {
       break;
     case 'startNow':
       c.queue?.vote(c);
+      break;
+    case 'party': {
+      const size = MAP_SIZES.includes(Number(msg.size)) ? Number(msg.size) : 8;
+      c.queue?.remove(c);
+      c.party?.remove(c);
+      new Party(size).add(c);
+      break;
+    }
+    case 'join': {
+      const code = cleanCode(msg.code);
+      const p = parties.get(code);
+      if (p && p === c.party) return p.broadcast();
+      if (!p) {
+        const reason = ++c.badJoins > MAX_BAD_JOINS
+          ? 'Too many wrong codes. Refresh the page to try again.'
+          : `There's no party with the code ${code || '(blank)'}. It may have ended.`;
+        return send(c, { k: 'noParty', reason });
+      }
+      if (c.badJoins > MAX_BAD_JOINS) return send(c, { k: 'noParty', reason: 'Too many wrong codes. Refresh the page to try again.' });
+      if (p.members.length >= MAX_PARTY) return send(c, { k: 'noParty', reason: `That party is full (${MAX_PARTY} players).` });
+      c.queue?.remove(c);
+      c.party?.remove(c);
+      p.add(c);
+      break;
+    }
+    case 'partySize': {
+      const p = c.party;
+      const size = Number(msg.size);
+      if (!p || p.host !== c || !MAP_SIZES.includes(size) || size < p.members.length) return;
+      p.size = size;
+      p.broadcast();
+      break;
+    }
+    case 'partyStart':
+      c.party?.start(c);
+      break;
+    case 'partyLeave':
+      c.party?.remove(c);
       break;
     case 'cmd':
       if (c.match && c.budget-- > 0) c.match.command(c, msg.c);
@@ -351,9 +479,12 @@ function onMessage(c: Client, msg: ClientMsg): void {
     }
     case 'leave':
       if (c.match) {
+        // Leaving on purpose gives the base to a bot for good; only a dropped connection gets it back.
+        if (c.pid >= 0) c.match.tokens.delete(c.token);
         c.match.drop(c, true);
         c.match = null;
         c.pid = -1;
+        c.party?.broadcast();
       }
       break;
     case 'resync':
@@ -429,8 +560,8 @@ wss.on('connection', (ws: WebSocket) => {
     return;
   }
   const c: Client = {
-    ws, id: nextClientId++, name: 'Builder', token: '', queue: null, match: null, pid: -1,
-    budget: 40, msgs: 0, lastSnap: 0, snapTimer: null,
+    ws, id: nextClientId++, name: 'Builder', token: '', queue: null, party: null, match: null, pid: -1,
+    badJoins: 0, budget: 40, msgs: 0, lastSnap: 0, snapTimer: null,
   };
   clients.add(c);
   ws.on('message', (data) => {
@@ -452,6 +583,7 @@ wss.on('connection', (ws: WebSocket) => {
     if (c.snapTimer) clearTimeout(c.snapTimer);
     clients.delete(c);
     c.queue?.remove(c);
+    c.party?.remove(c);
     c.match?.drop(c, false);
   });
 });

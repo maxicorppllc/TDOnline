@@ -257,7 +257,7 @@ button.gold { background: #8a6a1e; border-color: var(--gold); }
   background: radial-gradient(ellipse at center, rgba(40, 20, 80, 0.55), rgba(5, 5, 15, 0.92));
   z-index: 10;
 }
-.card { padding: 28px 34px; width: min(560px, 92vw); text-align: center; }
+.card { padding: 28px 34px; width: min(560px, 92vw); max-height: 96vh; overflow-y: auto; text-align: center; }
 .logo {
   font-size: 64px;
   font-weight: 700;
@@ -313,6 +313,26 @@ button.gold { background: #8a6a1e; border-color: var(--gold); }
 .live .row button { font-size: 13px; padding: 4px 10px; }
 .sizes button small.q { color: var(--good); }
 .notice { color: var(--bad); font-size: 14px; margin-bottom: 10px; }
+
+.joinrow { display: flex; gap: 6px; margin-top: 8px; }
+.joinrow input, .invite input {
+  flex: 1; min-width: 0;
+  font-family: var(--font); font-size: 16px; color: var(--ink);
+  background: #120e20; border: 2px solid var(--edge-hi); padding: 8px 10px; outline: none;
+  user-select: text;
+}
+.joinrow input:focus, .invite input:focus { border-color: var(--accent); }
+.party-label { color: var(--muted); font-size: 14px; letter-spacing: 1px; text-transform: uppercase; }
+.party-code {
+  font-size: 52px; font-weight: 700; line-height: 1.1;
+  letter-spacing: 8px; padding-left: 8px; /* balances the trailing letter space */
+  color: var(--gold);
+  text-shadow: 0 4px 0 #8a5a12, 0 8px 0 #0b0916;
+}
+.party-code + .tag { margin: 10px 0 12px; }
+.invite { display: flex; gap: 6px; margin-bottom: 16px; }
+.field label span { color: var(--muted); }
+.queue-list small { color: var(--muted); font-size: 12px; margin-left: 4px; }
 
 /* Narrow windows: drop the extras before things collide. */
 @media (max-width: 1250px) {

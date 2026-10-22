@@ -19,12 +19,17 @@ client with hot reload on the same port.
 - **Find match** joins the online queue. Other players in the same queue land in
   your match; after 20 seconds (or when everyone clicks *Start now*), bots fill
   the empty seats.
+- **Play with friends** makes a private party with an invite link (`/?join=CODE`).
+  Friends who open the link, or type the code into *Join party*, land in your party.
+  The host picks the map size and starts; bots fill the empty seats. The party stays
+  together between matches, so *Back to party* after a match lines up the next one.
 - **Practice offline** is you plus bots, entirely in the browser. Add `?dev` to
   the URL for cheat keys there: `]` brings the next wave forward, `[` gives 500 gold.
 - **Live matches** in the lobby can be watched as a spectator.
 
 To try multiplayer on one machine, open the page in two browser tabs (each tab is
-its own player) and queue both for the same map size.
+its own player) and queue both for the same map size, or make a party in one tab
+and open its invite link in the other.
 
 > **Windows PowerShell:** if `npm` says "running scripts is disabled on this system",
 > type `npm.cmd` instead (`npm.cmd run dev`). It's the same command without the
@@ -92,7 +97,10 @@ commands cross the network, never the horde itself.
   has drifted asks for a full snapshot and carries on from that.
 - Spectators and players coming back from a refresh get a snapshot, then the stream.
 - A disconnected player has 15 seconds to come back before a bot takes over their base.
-  Coming back later hands the base back.
+  Coming back later hands the base back. Leaving with the *Leave* button gives the
+  base to the bot for good.
+- Parties live on the server too. A party with nobody in it stays joinable for a
+  minute, so a host who refreshes gets back in.
 
 ## Layout
 

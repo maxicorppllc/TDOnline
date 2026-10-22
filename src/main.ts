@@ -5,8 +5,8 @@ import { BUILDINGS, TICK, TOWER_TYPES } from './config.ts';
 import type { TowerType } from './config.ts';
 import { Game } from './game.ts';
 import type { Command } from './game.ts';
-import { MAP_SIZES } from './protocol.ts';
-import type { LiveMatch, ServerMsg } from './protocol.ts';
+import { MAP_SIZES, PARTY_CODE_LEN, cleanCode } from './protocol.ts';
+import type { LiveMatch, PartyMember, ServerMsg } from './protocol.ts';
 import { Net } from './net.ts';
 import { Renderer } from './render.ts';
 import { Hud } from './ui.ts';
@@ -57,6 +57,16 @@ let lobby: { online: number; queues: Record<number, number>; matches: LiveMatch[
 let current: Match | null = null;
 let screen: HTMLElement | null = null;
 
+const SIZE_LABEL: Record<number, string> = { 4: 'small', 8: 'standard', 16: 'huge' };
+
+/**
+ * The party this tab is in. Its code sits in the URL (?join=CODE), so the invite
+ * link and a refresh both land you back in it. The code is blank while a new party is being made.
+ */
+let partyCode = cleanCode(new URLSearchParams(location.search).get('join'));
+let inParty = !!partyCode;
+let party: { code: string; size: number; members: PartyMember[]; you: number } | null = null;
+
 const net = new Net(() => ({ k: 'hello', name: playerName, token: TOKEN }));
 
 function setScreen(el: HTMLElement | null): void {
@@ -74,10 +84,19 @@ function endCurrent(): void {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
+/** Back to wherever this player waits between matches: their party, or the lobby. */
+function home(notice = ''): void {
+  if (inParty) showParty(notice);
+  else showLobby(notice);
+}
+
 // ------------------------------------------------------------------ server messages
 
 net.onStatus = (on) => {
+  // The server forgets party members whose connection drops, so sign back in.
+  if (on && inParty) net.send(partyCode ? { k: 'join', code: partyCode } : { k: 'party', size: mapSize });
   if (screen?.dataset.view === 'lobby') updateLobby();
+  if (screen?.dataset.view === 'party') updateParty();
   if (screen?.dataset.view === 'queue' && !on) showLobby('Lost connection to the game server.');
   current?.netStatus(on);
 };
@@ -92,6 +111,17 @@ net.onMessage = (m: ServerMsg) => {
       break;
     case 'queue':
       if (screen?.dataset.view === 'queue') updateQueue(m);
+      break;
+    case 'party':
+      if (!inParty) break; // a late update from a party we just left
+      party = m;
+      partyCode = m.code;
+      setInviteUrl(m.code);
+      if (screen?.dataset.view === 'party') updateParty();
+      break;
+    case 'noParty':
+      forgetParty();
+      if (screen?.dataset.view === 'party') showLobby(m.reason);
       break;
     case 'start': {
       setScreen(null);
@@ -119,13 +149,26 @@ net.onMessage = (m: ServerMsg) => {
       current?.onSum(m.tick, m.sum);
       break;
     case 'ended':
-      if (current && current.online && !current.resultShown) showLobby(m.reason);
+      if (current && current.online && !current.resultShown) home(m.reason);
       break;
     case 'error':
       if (screen?.dataset.view === 'lobby') showLobby(m.text);
+      else if (screen?.dataset.view === 'party') partyNotice(m.text);
       break;
   }
 };
+
+/** Your name box on the lobby and party screens. Returns a function that saves it now. */
+function bindName(el: HTMLElement): () => void {
+  const input = el.querySelector('#name') as HTMLInputElement;
+  const commit = () => {
+    playerName = input.value.trim().slice(0, 16) || 'Builder';
+    save('tdo.name', playerName);
+    net.send({ k: 'hello', name: playerName, token: TOKEN });
+  };
+  input.addEventListener('change', commit);
+  return commit;
+}
 
 // ------------------------------------------------------------------ lobby
 
@@ -144,12 +187,17 @@ function showLobby(notice = ''): void {
       <div class="field"><label>Your name</label><input id="name" maxlength="16" value="${esc(playerName)}" /></div>
       <div class="field"><label>Map size</label>
         <div class="sizes">
-          ${MAP_SIZES.map((n) => `<button data-n="${n}" class="${n === mapSize ? 'on' : ''}">${n}<small>${n === 4 ? 'small' : n === 8 ? 'standard' : 'huge'}</small><small class="q" data-q="${n}"></small></button>`).join('')}
+          ${MAP_SIZES.map((n) => `<button data-n="${n}" class="${n === mapSize ? 'on' : ''}">${n}<small>${SIZE_LABEL[n]}</small><small class="q" data-q="${n}"></small></button>`).join('')}
         </div>
       </div>
       <div class="actions">
         <button id="play" class="primary">Find match</button>
+        <button id="party" class="gold">Play with friends</button>
         <button id="practice">Practice offline (you + bots)</button>
+      </div>
+      <div class="joinrow">
+        <input id="code" placeholder="Party code or link" spellcheck="false" autocomplete="off" />
+        <button id="join">Join party</button>
       </div>
       <div class="live"><h3>Live matches</h3><div id="live"></div></div>
       <div class="how">
@@ -161,13 +209,7 @@ function showLobby(notice = ''): void {
       <div class="shards">Shards: ${shards}</div>
     </div>`;
   setScreen(el);
-  const input = el.querySelector('#name') as HTMLInputElement;
-  const commitName = () => {
-    playerName = input.value.trim().slice(0, 16) || 'Builder';
-    save('tdo.name', playerName);
-    net.send({ k: 'hello', name: playerName, token: TOKEN });
-  };
-  input.addEventListener('change', commitName);
+  const commitName = bindName(el);
   for (const b of el.querySelectorAll<HTMLButtonElement>('.sizes button')) {
     b.onclick = () => {
       mapSize = Number(b.dataset.n);
@@ -184,6 +226,35 @@ function showLobby(notice = ''): void {
     commitName();
     startPractice(mapSize);
   };
+  (el.querySelector('#party') as HTMLButtonElement).onclick = () => {
+    commitName();
+    inParty = true;
+    partyCode = '';
+    party = null;
+    showParty();
+    net.send({ k: 'party', size: mapSize });
+  };
+  const codeIn = el.querySelector('#code') as HTMLInputElement;
+  const join = () => {
+    // Accept the bare code or a whole pasted invite link.
+    const raw = codeIn.value;
+    const code = cleanCode(/join=([^&#]+)/i.exec(raw)?.[1] ?? raw);
+    if (code.length < PARTY_CODE_LEN) {
+      codeIn.focus();
+      return;
+    }
+    commitName();
+    inParty = true;
+    partyCode = code;
+    party = null;
+    setInviteUrl(code);
+    showParty();
+    net.send({ k: 'join', code });
+  };
+  (el.querySelector('#join') as HTMLButtonElement).onclick = join;
+  codeIn.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') join();
+  });
   updateLobby();
 }
 
@@ -195,7 +266,7 @@ function updateLobby(): void {
   (el.querySelector('#statustext') as HTMLElement).textContent = net.connected
     ? `Connected · ${lobby?.online ?? 1} online`
     : 'Game server offline. Practice still works; start the server with npm run dev.';
-  (el.querySelector('#play') as HTMLButtonElement).disabled = !net.connected;
+  for (const id of ['#play', '#party', '#join']) (el.querySelector(id) as HTMLButtonElement).disabled = !net.connected;
   for (const q of el.querySelectorAll<HTMLElement>('[data-q]')) {
     const n = lobby?.queues[Number(q.dataset.q)] ?? 0;
     q.textContent = net.connected && n ? `${n} in queue` : '';
@@ -278,6 +349,154 @@ function updateQueue(m: { size: number; names: string[]; startsIn: number; votes
   (el.querySelector('#qwait') as HTMLElement).textContent = wait + votes;
 }
 
+// ------------------------------------------------------------------ party
+
+function inviteLink(code: string): string {
+  return `${location.origin}${location.pathname}?join=${code}`;
+}
+
+/** Keeps the address bar on the invite link while you're in a party. */
+function setInviteUrl(code: string): void {
+  const u = new URL(location.href);
+  if (code) u.searchParams.set('join', code);
+  else u.searchParams.delete('join');
+  history.replaceState(null, '', u);
+}
+
+function forgetParty(): void {
+  inParty = false;
+  partyCode = '';
+  party = null;
+  setInviteUrl('');
+}
+
+function partyNotice(text: string): void {
+  const n = screen?.querySelector('#pnotice') as HTMLElement | null;
+  if (!n) return;
+  n.textContent = text;
+  n.classList.toggle('hidden', !text);
+}
+
+function showParty(notice = ''): void {
+  endCurrent();
+  const el = document.createElement('div');
+  el.className = 'screen';
+  el.dataset.view = 'party';
+  el.innerHTML = `
+    <div class="card panel">
+      <div class="party-label">Party code</div>
+      <div class="party-code" id="pcode"></div>
+      <div class="tag">Send your friends this link. Bots take any seats they don't fill.</div>
+      <div class="invite"><input id="plink" readonly /><button id="copy">Copy link</button></div>
+      <div class="notice hidden" id="pnotice"></div>
+      <div class="field"><label>Your name</label><input id="name" maxlength="16" value="${esc(playerName)}" /></div>
+      <div class="field"><label>Map size <span id="sizewho"></span></label>
+        <div class="sizes">
+          ${MAP_SIZES.map((n) => `<button data-n="${n}">${n}<small>${SIZE_LABEL[n]}</small></button>`).join('')}
+        </div>
+      </div>
+      <div class="queue-list" id="pl"></div>
+      <div class="tag" id="pwait"></div>
+      <div class="row-btns">
+        <button id="pstart" class="primary">Start match</button>
+        <button id="pleave">Leave party</button>
+      </div>
+    </div>`;
+  setScreen(el);
+  partyNotice(notice);
+  bindName(el);
+  const link = el.querySelector('#plink') as HTMLInputElement;
+  link.onclick = () => link.select();
+  const copy = el.querySelector('#copy') as HTMLButtonElement;
+  copy.onclick = async () => {
+    if (!link.value) return;
+    try {
+      await navigator.clipboard.writeText(link.value);
+      copy.textContent = 'Copied!';
+    } catch {
+      // No clipboard access (plain http, or blocked): leave it selected for Ctrl+C.
+      link.select();
+      copy.textContent = 'Press Ctrl+C';
+    }
+    window.setTimeout(() => (copy.textContent = 'Copy link'), 1800);
+  };
+  for (const b of el.querySelectorAll<HTMLButtonElement>('.sizes button')) {
+    b.onclick = () => {
+      mapSize = Number(b.dataset.n);
+      save('tdo.size', String(mapSize));
+      net.send({ k: 'partySize', size: mapSize });
+    };
+  }
+  (el.querySelector('#pstart') as HTMLButtonElement).onclick = (e) => {
+    partyNotice('');
+    net.send({ k: 'partyStart' });
+    (e.currentTarget as HTMLButtonElement).disabled = true; // the next party update re-enables it
+  };
+  (el.querySelector('#pleave') as HTMLButtonElement).onclick = () => {
+    net.send({ k: 'partyLeave' });
+    forgetParty();
+    showLobby();
+  };
+  updateParty();
+}
+
+function updateParty(): void {
+  const el = screen;
+  if (!el || el.dataset.view !== 'party') return;
+  const $ = <T extends HTMLElement = HTMLElement>(s: string) => el.querySelector(s) as T;
+  const p = party;
+  const host = !!p?.members[p.you]?.host;
+  const ready = p ? p.members.filter((m) => !m.playing).length : 0;
+  const busy = p ? p.members.length - ready : 0;
+
+  $('#pcode').textContent = p?.code ?? (partyCode || '· · · · ·');
+  $<HTMLInputElement>('#plink').value = p ? inviteLink(p.code) : '';
+  $<HTMLButtonElement>('#copy').disabled = !p;
+  $('#sizewho').textContent = p && !host ? '(the host picks)' : '';
+  for (const b of el.querySelectorAll<HTMLButtonElement>('.sizes button')) {
+    const n = Number(b.dataset.n);
+    b.classList.toggle('on', n === p?.size);
+    b.disabled = !p || !host || !net.connected || n < p.members.length;
+  }
+
+  const list = $('#pl');
+  const key = JSON.stringify(p && [p.size, p.you, p.members]);
+  if (list.dataset.key !== key) {
+    list.dataset.key = key;
+    list.innerHTML = '';
+    for (let i = 0; p && i < p.size; i++) {
+      const d = document.createElement('div');
+      const m = p.members[i];
+      if (m) {
+        d.style.setProperty('--c', m.host ? '#4aa3ff' : '#ffd23f');
+        const tags = [m.host && 'host', i === p.you && 'you', m.playing && 'in a match'].filter(Boolean);
+        d.innerHTML = `${esc(m.name)}${tags.length ? ` <small>${tags.join(' · ')}</small>` : ''}`;
+      } else {
+        d.className = 'empty';
+        d.textContent = 'open seat';
+      }
+      list.appendChild(d);
+    }
+  }
+
+  const start = $<HTMLButtonElement>('#pstart');
+  start.classList.toggle('hidden', !host);
+  start.textContent = busy ? `Start with ${ready}` : 'Start match';
+  start.disabled = !net.connected || !ready;
+
+  let wait: string;
+  if (!net.connected) wait = 'Connecting to the game server...';
+  else if (!p) wait = partyCode ? `Joining party ${partyCode}...` : 'Setting up your party...';
+  else {
+    const open = p.size - p.members.length;
+    const bots = open ? `Bots take the ${open} empty seat${open === 1 ? '' : 's'}.` : 'Every seat is taken.';
+    const hostName = p.members.find((m) => m.host)?.name ?? 'the host';
+    const out = busy ? ` ${busy === 1 ? 'One player is' : `${busy} players are`} still in a match and will miss it unless you wait.` : '';
+    wait = host ? `Start when you're ready. ${bots}${out}` : `Waiting for ${hostName} to start. ${bots}`;
+  }
+  $('#pwait').textContent = wait;
+}
+
 // ------------------------------------------------------------------ results
 
 function showResult(m: Match): void {
@@ -306,12 +525,17 @@ function showResult(m: Match): void {
       </div>
       <div class="bonus-note">Every base that survives raises everyone's reward, even for players who fell.</div>` : ''}
       <div class="row-btns">
-        ${pr ? '<button id="again" class="primary">Play again</button>' : ''}
+        ${inParty ? '<button id="party" class="primary">Back to party</button>' : ''}
+        ${pr && !inParty ? '<button id="again" class="primary">Play again</button>' : ''}
         <button id="watch">Keep watching</button>
-        <button id="lobby">Lobby</button>
+        ${inParty ? '' : '<button id="lobby">Lobby</button>'}
       </div>
     </div>`;
   setScreen(el);
+  el.querySelector<HTMLButtonElement>('#party')?.addEventListener('click', () => {
+    if (m.online) net.send({ k: 'leave' });
+    showParty();
+  });
   el.querySelector<HTMLButtonElement>('#again')?.addEventListener('click', () => {
     if (m.online) {
       net.send({ k: 'leave' });
@@ -322,10 +546,10 @@ function showResult(m: Match): void {
     }
   });
   (el.querySelector('#watch') as HTMLButtonElement).onclick = () => setScreen(null);
-  (el.querySelector('#lobby') as HTMLButtonElement).onclick = () => {
+  el.querySelector<HTMLButtonElement>('#lobby')?.addEventListener('click', () => {
     if (m.online) net.send({ k: 'leave' });
     showLobby();
-  };
+  });
 }
 
 // ------------------------------------------------------------------ match
@@ -506,7 +730,7 @@ class Match {
       this.acc = Math.max(0, this.acc - TICK);
       steps++;
     }
-    if (this.lostAt && performance.now() - this.lostAt > 4000) showLobby('The server restarted, so that match is gone.');
+    if (this.lostAt && performance.now() - this.lostAt > 4000) home('The server restarted, so that match is gone.');
   }
 
   // ---------------------------------------------------------------- actions
@@ -515,7 +739,7 @@ class Match {
     const playing = this.viewer >= 0 && this.game.phase !== 'over';
     if (playing && !confirm(this.online ? 'Leave this match? A bot will take over your base.' : 'Leave this practice match?')) return;
     if (this.online) net.send({ k: 'leave' });
-    showLobby();
+    home();
   }
 
   private get me() {
@@ -709,4 +933,4 @@ class Match {
   };
 }
 
-showLobby();
+home();
