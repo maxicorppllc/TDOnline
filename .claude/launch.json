@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tdonline",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["server/index.ts", "--dev"],
+      "port": 5173
+    }
+  ]
+}

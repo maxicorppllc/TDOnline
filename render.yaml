@@ -1,0 +1,14 @@
+# Render Blueprint: New > Blueprint in the Render dashboard, pick this repo.
+# The free plan supports WebSockets but sleeps after 15 idle minutes;
+# the first visit after that takes about a minute to wake it.
+services:
+  - type: web
+    name: tdonline
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: node server/index.ts
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
